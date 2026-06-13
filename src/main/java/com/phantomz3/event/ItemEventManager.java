@@ -1,0 +1,175 @@
+package com.phantomz3.event;
+
+import com.mojang.authlib.GameProfile;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.ProfileComponent;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.entity.attribute.EntityAttributes;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.screen.SimpleNamedScreenHandlerFactory;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.Hand;
+import net.minecraft.util.Formatting;
+import net.minecraft.component.type.NbtComponent;
+import net.minecraft.inventory.SimpleInventory;
+import net.minecraft.server.BannedPlayerList;
+
+import com.phantomz3.LifestealMod;
+import com.phantomz3.ModConfig;
+import com.phantomz3.ReviveScreenHandler;
+import me.shedaniel.autoconfig.AutoConfig;
+
+import java.util.Optional;
+import java.util.UUID;
+
+public class ItemEventManager {
+
+	private final LifestealMod mod;
+	private static final double HEART_VALUE = 2.0;
+
+	public ItemEventManager(LifestealMod mod) {
+		this.mod = mod;
+	}
+
+	public void register() {
+		registerHeartItemUsage();
+		registerReviveBeaconUsage();
+		registerRiptideCooldown();
+	}
+
+	private void registerHeartItemUsage() {
+		UseItemCallback.EVENT.register((player, world, hand) -> {
+			ItemStack itemStack = player.getStackInHand(hand);
+
+			if (!mod.isHeartItem(itemStack) || itemStack.hasGlint()) {
+				return ActionResult.PASS;
+			}
+
+			ModConfig config = getConfig();
+			double maxHealth = player.getAttributeBaseValue(EntityAttributes.MAX_HEALTH);
+
+			if (maxHealth >= config.maxHeartCap) {
+				player.sendMessage(
+						Text.literal("You have reached the maximum heart limit!").formatted(Formatting.RED),
+						true);
+				return ActionResult.FAIL;
+			}
+
+			player.getAttributeInstance(EntityAttributes.MAX_HEALTH).setBaseValue(maxHealth + HEART_VALUE);
+			player.heal((float) HEART_VALUE);
+
+			if (!player.getAbilities().creativeMode) {
+				itemStack.decrement(1);
+			}
+
+			player.sendMessage(Text.literal("You gained an additional heart!").formatted(Formatting.GREEN), true);
+			return ActionResult.SUCCESS;
+		});
+	}
+
+	private void registerReviveBeaconUsage() {
+		// Handles right-click on AIR (and as a fallback for any item-use trigger)
+		UseItemCallback.EVENT.register((player, world, hand) -> {
+			ItemStack itemStack = player.getStackInHand(hand);
+
+			if (!mod.isReviveBeacon(itemStack) || world.isClient()) {
+				return ActionResult.PASS;
+			}
+
+			if (player instanceof ServerPlayerEntity serverPlayer) {
+				openReviveGUI(serverPlayer);
+			}
+
+			// SUCCESS = cancels any default use action, keeps item in hand
+			return ActionResult.SUCCESS;
+		});
+
+		// Handles right-click on a BLOCK - prevents placement, opens GUI instead
+		UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+			ItemStack itemStack = player.getStackInHand(hand);
+
+			if (!mod.isReviveBeacon(itemStack)) {
+				return ActionResult.PASS;
+			}
+
+			if (world.isClient()) {
+				// Tell client to cancel too, prevents ghost block render
+				return ActionResult.SUCCESS;
+			}
+
+			if (player instanceof ServerPlayerEntity serverPlayer) {
+				openReviveGUI(serverPlayer);
+			}
+
+			// SUCCESS instead of FAIL: blocks vanilla placement logic cleanly
+			// without triggering desync/refund issues
+			return ActionResult.SUCCESS;
+		});
+	}
+
+	private void registerRiptideCooldown() {
+		ModConfig config = getConfig();
+
+		if (!config.riptideCooldownEnabled) {
+			return;
+		}
+
+		UseItemCallback.EVENT.register((player, world, hand) -> {
+			if (world.isClient()) {
+				return ActionResult.PASS;
+			}
+
+			ItemStack itemStack = player.getStackInHand(hand);
+
+			if (itemStack.getItem() != Items.TRIDENT || !player.isUsingRiptide()) {
+				return ActionResult.PASS;
+			}
+
+			if (player.getItemCooldownManager().isCoolingDown(itemStack)) {
+				return ActionResult.FAIL;
+			}
+
+			player.getItemCooldownManager().set(itemStack, config.riptideCooldown);
+			return ActionResult.SUCCESS;
+		});
+	}
+
+	private void openReviveGUI(ServerPlayerEntity player) {
+		SimpleInventory inventory = new SimpleInventory(27);
+		MinecraftServer server = player.getEntityWorld().getServer();
+
+		for (UUID uuid : LifestealMod.eliminatedPlayers) {
+			GameProfile profile = server.getApiServices().profileResolver().getProfileById(uuid).orElse(null);
+			if (profile == null) continue;
+
+			ItemStack playerHead = new ItemStack(Items.PLAYER_HEAD);
+			playerHead.set(DataComponentTypes.PROFILE, ProfileComponent.ofStatic(profile));
+			playerHead.set(DataComponentTypes.ITEM_NAME, Text.literal(profile.name()));
+			inventory.addStack(playerHead);
+		}
+
+		for (int i = 0; i < inventory.size(); i++) {
+			if (inventory.getStack(i).isEmpty()) {
+				ItemStack glassPane = new ItemStack(Items.GRAY_STAINED_GLASS_PANE);
+				glassPane.set(DataComponentTypes.ITEM_NAME, Text.literal("Empty"));
+				inventory.setStack(i, glassPane);
+			}
+		}
+
+		player.openHandledScreen(new SimpleNamedScreenHandlerFactory(
+				(syncId, playerInventory, playerEntity) -> new ReviveScreenHandler(syncId, playerInventory, inventory),
+				Text.of("Revive Players")));
+	}
+
+	private ModConfig getConfig() {
+		return AutoConfig.getConfigHolder(ModConfig.class).getConfig();
+	}
+}
+
